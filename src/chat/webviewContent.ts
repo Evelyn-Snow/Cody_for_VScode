@@ -12,12 +12,12 @@ import * as path from 'path';
 export function getChatWebviewContent(webview: vscode.Webview, extensionUri: vscode.Uri): string {
   const nonce = getNonce();
 
-  // 读取 HTML 模板
-  const htmlPath = path.join(extensionUri.fsPath, 'src', 'chat', 'chat.html');
+  // 读取 HTML 模板（打包后从 out/ 加载）
+  const htmlPath = path.join(extensionUri.fsPath, 'out', 'chat', 'chat.html');
   let html = fs.readFileSync(htmlPath, 'utf-8');
 
-  // 读取 JS 脚本
-  const jsPath = path.join(extensionUri.fsPath, 'src', 'chat', 'chat.js');
+  // 读取 JS 脚本（打包后从 out/ 加载）
+  const jsPath = path.join(extensionUri.fsPath, 'out', 'chat', 'chat.js');
   let js = fs.readFileSync(jsPath, 'utf-8');
 
   // 注入 CSP 的 nonce

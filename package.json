@@ -2,7 +2,7 @@
   "name": "cody-for-vscode",
   "displayName": "Cody for VSCode",
   "description": "Cody — 内嵌 VSCode 的 AI 编程助手，支持 Assistant 单次问答与 Agent 长对话工具调用",
-  "version": "0.1.1-build.3",
+  "version": "0.1.1-build.4",
   "publisher": "cody",
   "license": "MIT",
   "repository": {
@@ -249,8 +249,9 @@
     }
   },
   "scripts": {
-    "vscode:prepublish": "npm run compile",
+    "vscode:prepublish": "npm run compile && npm run copy-assets",
     "compile": "tsc -p ./",
+    "copy-assets": "node -e \"const fs=require('fs'),p=require('path');['chat.html','chat.js'].forEach(f=>{const src=p.join('src','chat',f),dst=p.join('out','chat',f);if(!fs.existsSync(p.dirname(dst)))fs.mkdirSync(p.dirname(dst),{recursive:true});fs.copyFileSync(src,dst)})\"",
     "watch": "tsc -watch -p ./",
     "lint": "eslint src --ext ts"
   },

@@ -2,7 +2,7 @@
 
 [![VSCode](https://img.shields.io/badge/VSCode-%5E1.63.0-blue)](https://code.visualstudio.com/)
 [![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
-[![Version](https://img.shields.io/badge/version-0.1.1--build.3-orange)](package.json)
+[![Version](https://img.shields.io/badge/version-0.1.1--build.4-orange)](package.json)
 
 > **Cody** — 内嵌 VSCode 的 AI 编程助手，深度融合到编辑器工作流中，提供实时代码补全、下拉候选列表、多轮对话以及自主 Agent 工具链。
 
