@@ -256,6 +256,21 @@ function parseXmlToolCalls(xml: string): ToolCall[] {
   return calls;
 }
 
+/** 还原 JSON 字符串转义（单次扫描，避免多轮 replace 的顺序污染：如 \\n 应得到「\ + n」而非换行） */
+function unescapeJsonString(s: string): string {
+  return s.replace(/\\(.)/g, (_m: string, c: string) => {
+    switch (c) {
+      case 'n': return '\n';
+      case 't': return '\t';
+      case 'r': return '';
+      case '"': return '"';
+      case '\\': return '\\';
+      case '/': return '/';
+      default: return c;
+    }
+  });
+}
+
 /** JSON.parse 失败时的通用兜底：提取所有 name/arguments 字段 */
 export function salvageToolJson(raw: string): any | null {
   // 提取 name
@@ -269,19 +284,22 @@ export function salvageToolJson(raw: string): any | null {
     const pathMatch = raw.match(/"path"\s*:\s*"((?:[^"\\]|\\.)*)"/);
     if (!pathMatch) return null;
 
-    const contentKeyIdx = raw.indexOf('"content": "');
+    // 定位 content 值起点（兼容 "content": " 与 "content":" 两种书写）
+    const contentKeyIdx = raw.indexOf('"content"');
     if (contentKeyIdx === -1) return null;
-    const contentStart = contentKeyIdx + '"content": "'.length;
+    const colonIdx = raw.indexOf(':', contentKeyIdx + '"content"'.length);
+    if (colonIdx === -1) return null;
+    let contentStart = colonIdx + 1;
+    while (contentStart < raw.length && /\s/.test(raw[contentStart])) contentStart++;
+    if (raw[contentStart] !== '"') return null;
+    contentStart++;
 
-    // content 终点：最后一个 " 后跟 } } ] } 结构
-    const tailMatch = raw.match(/"(?:\s*\}\s*\]\s*\}|\s*\}\s*\])$/);
-    if (!tailMatch || tailMatch.index === undefined || tailMatch.index <= contentStart) return null;
+    // content 终点：从末尾跳过所有闭合符/空白（任意嵌套深度），应停在收尾引号上
+    let end = raw.length;
+    while (end > contentStart && /[\s}\])]/.test(raw[end - 1])) end--;
+    if (end <= contentStart || raw[end - 1] !== '"') return null;
 
-    let content = raw.substring(contentStart, tailMatch.index)
-      .replace(/\\"/g, '"')
-      .replace(/\\n/g, '\n')
-      .replace(/\\t/g, '\t')
-      .replace(/\\\\/g, '\\');
+    let content = unescapeJsonString(raw.substring(contentStart, end - 1));
     if (!content) return null;
 
     return {
@@ -297,11 +315,7 @@ export function salvageToolJson(raw: string): any | null {
     if (m[1] === 'name' || m[1] === 'calls') continue;
     let v: any = m[2];
     if (v.startsWith('"')) {
-      v = v.slice(1, -1)
-        .replace(/\\"/g, '"')
-        .replace(/\\n/g, '\n')
-        .replace(/\\t/g, '\t')
-        .replace(/\\\\/g, '\\');
+      v = unescapeJsonString(v.slice(1, -1));
     } else if (v === 'true') v = true;
     else if (v === 'false') v = false;
     else if (v === 'null') v = null;
@@ -841,13 +855,18 @@ print(''.join([p.extract_text() or '' for p in r.pages]))
         const tmpPy = path.join(os.tmpdir(), `cody_pdf_${Date.now()}_${Math.random().toString(36).slice(2)}.py`);
         fs.writeFileSync(tmpPy, pyScript, 'utf-8');
         try {
-          const out = execFileSync('python', [tmpPy, fp], {
-            encoding: 'utf-8', timeout: 60000, maxBuffer: 10 * 1024 * 1024,
-            windowsHide: true,
-          });
+          // Windows 常见两种入口：python.exe 与 py 启动器，依次尝试（均为固定字面量）
+          let out: string | null = null;
+          for (const py of ['python', 'py']) {
+            try {
+              out = execFileSync(py, [tmpPy, fp], {
+                encoding: 'utf-8', timeout: 60000, maxBuffer: 10 * 1024 * 1024,
+                windowsHide: true,
+              });
+              break;
+            } catch { /* 启动器不存在或执行失败，尝试下一个 */ }
+          }
           return out || null;
-        } catch {
-          return null;
         } finally {
           try { fs.unlinkSync(tmpPy); } catch {}
         }

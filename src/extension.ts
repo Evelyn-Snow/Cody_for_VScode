@@ -39,6 +39,8 @@ export function activate(context: vscode.ExtensionContext) {
 
   // 2a. Inline 幽灵文字补全（需要 VSCode 1.68+）
   const inlineProvider = new CompletionProvider(completionEngine);
+  // 启动时同步配置开关（此前只在配置变更时同步，禁用状态下重启会失效）
+  inlineProvider.setEnabled(Settings.enableCompletion);
   const _languages = vscode.languages as any;
   if (_languages.registerInlineCompletionItemProvider) {
     context.subscriptions.push(

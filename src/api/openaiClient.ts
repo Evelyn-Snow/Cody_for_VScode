@@ -1,5 +1,6 @@
 import * as https from 'https';
 import * as http from 'http';
+import { StringDecoder } from 'string_decoder';
 import { URL } from 'url';
 import { Settings } from '../config/settings';
 
@@ -189,11 +190,21 @@ export class OpenAIClient {
     };
 
     return new Promise((resolve, reject) => {
+      // 请求发出前信号已中止 → 直接失败，避免监听不到状态变化
+      if (abortSignal?.aborted) {
+        reject(new Error('请求已被取消'));
+        return;
+      }
       const req = (isHttps ? https : http).request(options, (res) => {
+        // 响应中途连接异常（如被重置）：没有监听器会变成未捕获异常
+        res.on('error', (e: Error) => reject(new Error(`网络请求失败: ${e.message}`)));
+
         if (!expectStream) {
-          let data = '';
-          res.on('data', (chunk: Buffer) => { data += chunk.toString(); });
+          // 以 Buffer 收集后再统一解码，避免多字节字符（中文）跨 chunk 被截断
+          const chunks: Buffer[] = [];
+          res.on('data', (chunk: Buffer) => { chunks.push(chunk); });
           res.on('end', () => {
+            const data = Buffer.concat(chunks).toString('utf-8');
             if (res.statusCode !== 200) {
               let em = `API 请求失败 (${res.statusCode})`;
               try { const eb = JSON.parse(data); em = eb.error?.message || em; } catch {}
@@ -216,9 +227,10 @@ export class OpenAIClient {
 
         // 流式
         if (res.statusCode !== 200) {
-          let data = '';
-          res.on('data', (c: Buffer) => { data += c.toString(); });
+          const errChunks: Buffer[] = [];
+          res.on('data', (c: Buffer) => { errChunks.push(c); });
           res.on('end', () => {
+            const data = Buffer.concat(errChunks).toString('utf-8');
             let em = `API 请求失败 (${res.statusCode})`;
             try { const eb = JSON.parse(data); em = eb.error?.message || em; } catch {}
             reject(new Error(em));
@@ -226,9 +238,11 @@ export class OpenAIClient {
           return;
         }
 
+        // StringDecoder 处理跨 chunk 的多字节字符
+        const decoder = new StringDecoder('utf-8');
         let buffer = '';
         res.on('data', (chunk: Buffer) => {
-          buffer += chunk.toString();
+          buffer += decoder.write(chunk);
           const lines = buffer.split('\n');
           buffer = lines.pop() || '';
           for (const line of lines) {
@@ -251,6 +265,7 @@ export class OpenAIClient {
           }
         });
         res.on('end', () => {
+          buffer += decoder.end();
           if (buffer.trim()) {
             const t = buffer.trim();
             if (t.startsWith('data: ') && t.slice(6) !== '[DONE]') {
@@ -278,7 +293,7 @@ export class OpenAIClient {
         abortSignal.addEventListener('abort', () => {
           req.destroy();
           reject(new Error('请求已被取消'));
-        });
+        }, { once: true });
       }
 
       req.setTimeout(timeoutMs, () => {

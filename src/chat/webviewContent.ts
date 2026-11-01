@@ -26,10 +26,14 @@ export function getChatWebviewContent(webview: vscode.Webview, extensionUri: vsc
     `<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src ${webview.cspSource} 'unsafe-inline'; script-src 'nonce-${nonce}'; img-src data: https:;">`
   );
 
-  // 替换脚本占位符
+  // 替换脚本占位符。
+  // 用函数形式替换：字符串形式会解释替换串中的 $&、$' 等特殊序列，
+  // 而 chat.js 源码中出现这些序列时会破坏注入结果；
+  // 同时转义 </script>，避免脚本内容提前终止 <script> 标签。
+  const safeJs = js.replace(/<\/script>/gi, '<\\/script>');
   html = html.replace(
     /<script src="##NONCE_PLACEHOLDER##">[\s\S]*?<\/script>/,
-    `<script nonce="${nonce}">${js}</script>`
+    () => `<script nonce="${nonce}">${safeJs}</script>`
   );
 
   return html;

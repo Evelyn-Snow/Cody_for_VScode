@@ -140,12 +140,15 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
     webviewView.onDidChangeVisibility(() => { if (webviewView.visible) this.updateApiKeyStatus(); });
     this.updateApiKeyStatus();
 
-    vscode.workspace.onDidChangeConfiguration((e) => {
-      if (e.affectsConfiguration('aiAssistant')) {
-        openAIClient.refreshConfig();
-        this.updateApiKeyStatus();
-      }
-    });
+    // 配置监听器纳入订阅：webview 重建时自动释放，避免重复累积
+    this._context.subscriptions.push(
+      vscode.workspace.onDidChangeConfiguration((e) => {
+        if (e.affectsConfiguration('aiAssistant')) {
+          openAIClient.refreshConfig();
+          this.updateApiKeyStatus();
+        }
+      })
+    );
   }
 
   // ========== 消息路由 ==========
@@ -250,7 +253,7 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
       if (mode === 'agent') {
         await this.runAgentLoop(runId);
       } else {
-        await this.runAssistantRequest();
+        await this.runAssistantRequest(runId);
       }
     } catch (error) {
       if ((error as Error).message === '请求已被取消') { return; }
@@ -269,7 +272,7 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
   }
 
   /** Assistant 模式：一次请求直接返回 */
-  private async runAssistantRequest(): Promise<void> {
+  private async runAssistantRequest(runId: number): Promise<void> {
     let full = '';
     this.abortController = new AbortController();
     await openAIClient.streamChatCompletion(
@@ -277,11 +280,12 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
       (chunk) => { full += chunk; this.postMessage('streamChunk', { content: chunk }); },
       this.abortController.signal
     );
+    // 请求期间被新任务取代 → 不再写历史/UI（避免旧响应串进新对话）
+    if (runId !== this.runId) return;
     this.postMessage('streamEnd', {});
     // 记录 assistant 回应到历史（用于上下文）
     if (full) { this.assistantHistory.push({ role: 'assistant', content: full }); }
-    // 过长输出折叠（仅影响 UI，历史保持完整）
-    await this.collapseLongMessages();
+    // 过长输出折叠由 handleUserMessage 的 finally 统一执行（避免重复写临时文件）
   }
 
   /** Agent 循环：工具调用 → 执行 → 结果反馈 → 继续 */
@@ -344,7 +348,9 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
           if (runId !== this.runId) return;
           // 停止：由用户显式触发，重置标记后退出
           if (this.agentStopped) { this.agentStopped = false; return; }
-          // 仅暂停：继续循环，外层 while(this.agentPaused) 会等待恢复
+          // 仅暂停：归还本轮轮数后继续循环，外层 while(this.agentPaused) 会等待恢复
+          // （本轮请求被中断、未产出任何内容，不应消耗 maxAgentRounds）
+          round--;
           continue;
         }
         throw streamError;
@@ -689,6 +695,7 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
     if (contextMessages) this.agentHistory = [...contextMessages];
     this.postMessage('addMessage', { role: 'user', content: prompt });
     this.agentHistory.push({ role: 'user', content: prompt });
+    this.trimChatHistory();
     // 新任务代际 +1 并中断正在运行的旧任务
     const runId = ++this.runId;
     this.cancelStreaming();
@@ -716,6 +723,8 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
         this.agentRunning = false;
         this.agentPaused = false;
         this.postMessage('agentStatus', { running: false, paused: false });
+        // 与普通对话一致：流结束后折叠过长输出
+        await this.collapseLongMessages();
       }
     }
   }

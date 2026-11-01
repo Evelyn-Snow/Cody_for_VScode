@@ -58,7 +58,7 @@ export class DropdownCompletionProvider implements vscode.CompletionItemProvider
     placeholder.preselect = false;
     placeholder.detail = '后台 AI 正在生成补全';
     // 占位期间被接受时：以当前前缀替换自身（等价于无操作）
-    placeholder.insertText = new vscode.SnippetString(prefix);
+    placeholder.insertText = prefix;
     placeholder.range = new vscode.Range(wordStart, position);
     placeholder.filterText = prefix;
     // data 属性 VSCode 1.65+ 才有，用 any 兼容旧版类型定义
@@ -111,7 +111,9 @@ export class DropdownCompletionProvider implements vscode.CompletionItemProvider
     _position: vscode.Position,
     prefix: string
   ): vscode.CompletionItem[] {
-    const text = document.getText();
+    // 大文件限长扫描：本地匹配只是辅助，超出部分不再全文正则
+    const SCAN_LIMIT = 300_000;
+    const text = document.getText().substring(0, SCAN_LIMIT);
     const seen = new Set<string>();
     const items: vscode.CompletionItem[] = [];
     const lowerPrefix = prefix.toLowerCase();
@@ -151,7 +153,8 @@ export class DropdownCompletionProvider implements vscode.CompletionItemProvider
       : full.replace(/\n/g, '↵');
 
     const item = new vscode.CompletionItem(label, vscode.CompletionItemKind.Snippet);
-    item.insertText = new vscode.SnippetString(full);
+    // 纯文本插入（不能用 SnippetString：补全里的 ${...}、$1 会被当 snippet 语法解析而丢失）
+    item.insertText = full;
     item.range = new vscode.Range(wordStart, position);
     item.sortText = '!ai';
     item.filterText = full;

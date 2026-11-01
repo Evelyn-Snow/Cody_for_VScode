@@ -84,15 +84,16 @@ export class CompletionEngine implements vscode.Disposable {
     const wordStart = getWordStart(document, position);
     const prefix = getCurrentPrefix(document, position, wordStart);
     if (prefix.length < Settings.completionMinPrefix) return null;
-    const entry = this.cache.get(this.makeKey(document, wordStart));
+    const key = this.makeKey(document, wordStart);
+    const entry = this.cache.get(key);
     if (!entry) return null;
     if (Date.now() - entry.createdAt > CACHE_TTL_MS) {
-      this.cache.delete(this.makeKey(document, wordStart));
+      this.cache.delete(key);
       return null;
     }
     // 内容一致性校验：用户输入必须与补全开头一致（换词/改写自动失效）
     if (!entry.fullText.startsWith(prefix)) {
-      this.cache.delete(this.makeKey(document, wordStart));
+      this.cache.delete(key);
       return null;
     }
     return entry.fullText.slice(prefix.length);
@@ -247,7 +248,7 @@ export class CompletionEngine implements vscode.Disposable {
     );
     const afterLen = Math.min(
       Settings.completionContextAfterChars,
-      document.getText().length - offset
+      document.offsetAt(new vscode.Position(document.lineCount - 1, document.lineAt(document.lineCount - 1).text.length)) - offset
     );
     const codeAfter = document.getText(
       new vscode.Range(position, document.positionAt(offset + afterLen))
