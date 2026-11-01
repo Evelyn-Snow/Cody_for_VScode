@@ -1,6 +1,7 @@
 import * as vscode from 'vscode';
 import { CompletionProvider } from './completion/completionProvider';
 import { DropdownCompletionProvider } from './completion/dropdownProvider';
+import { CompletionEngine } from './completion/completionEngine';
 import { ChatPanelProvider } from './chat/chatPanel';
 import { registerExplainCommands } from './commands/explainCommands';
 import { openAIClient } from './api/openaiClient';
@@ -27,14 +28,17 @@ export function activate(context: vscode.ExtensionContext) {
     )
   );
 
-  // ========== 2. 注册双模补全 ==========
+  // ========== 2. 注册双模补全（共享统一 CompletionEngine） ==========
   const documentSelector: vscode.DocumentSelector = [
     { scheme: 'file', language: '*' },
     { scheme: 'untitled', language: '*' },
   ];
 
+  const completionEngine = new CompletionEngine();
+  context.subscriptions.push(completionEngine);
+
   // 2a. Inline 幽灵文字补全（需要 VSCode 1.68+）
-  const inlineProvider = new CompletionProvider();
+  const inlineProvider = new CompletionProvider(completionEngine);
   const _languages = vscode.languages as any;
   if (_languages.registerInlineCompletionItemProvider) {
     context.subscriptions.push(
@@ -45,7 +49,7 @@ export function activate(context: vscode.ExtensionContext) {
     console.log('[Cody] Inline 补全跳过（需要 VSCode ≥1.68，当前版本不支持）');
   }
 
-  const dropdownProvider = new DropdownCompletionProvider();
+  const dropdownProvider = new DropdownCompletionProvider(completionEngine);
   context.subscriptions.push(
     vscode.languages.registerCompletionItemProvider(
       documentSelector,
@@ -85,7 +89,7 @@ export function activate(context: vscode.ExtensionContext) {
         openAIClient.refreshConfig();
         const enabled = Settings.enableCompletion;
         inlineProvider.setEnabled(enabled);
-        dropdownProvider.clearCache();
+        completionEngine.clearCache();
       }
     })
   );

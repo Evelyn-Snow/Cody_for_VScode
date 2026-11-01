@@ -110,7 +110,7 @@ export function buildAgentSystemPrompt(skillsPrompt?: string): string {
 |\`list_files\`|列出目录内容|dir: 目录路径（相对路径，空=根目录）|
 |\`search_code\`|搜索代码|pattern: 搜索关键词|
 |\`delete_file\`|删除文件 ⚠️|path: 文件路径|
-|\`execute_command\`|执行终端命令 ⚠️|cmd: 命令|
+|\`execute_command\`|执行终端命令 ⚠️（白名单程序: git/node/npm/npx/tsc/python/py/pip，不支持管道/重定向等 shell 语法）|cmd: 命令|
 
 ## 办公文档工具
 
@@ -123,7 +123,7 @@ export function buildAgentSystemPrompt(skillsPrompt?: string): string {
 
 |\`todo\`|更新任务进度（追踪多步骤任务）|items: JSON数组 [{id, text, status: pending|in_progress|completed}]|
 
-> ⚠️ **read_pdf 内置四级回退（pdf-parse → PyPDF2 → pikepdf → 二进制提取），能应对绝大多数 PDF。永远不要用 execute_command 手动提取 PDF，直接用 read_pdf 工具。**
+> ⚠️ **read_pdf 内置三级回退（pdf-parse → PyPDF2 → 二进制提取），能应对绝大多数 PDF。永远不要用 execute_command 手动提取 PDF，直接用 read_pdf 工具。**
 
 ## 工程信息
 - 工程根目录: \`${rootPath}\`
@@ -385,7 +385,7 @@ export function formatToolResultsDetails(results: ToolResult[]): string {
         ? `文件已写入 \`${r.arguments.path}\`（${(r.arguments.content || '').length} 字符）`
         : r.output;
     } else if (r.name === 'write_docx' || r.name === 'edit_docx' || r.name === 'write_xlsx') {
-      body = r.success ? r.output : r.output;
+      body = r.output;
     } else if (r.name === 'read_xlsx') {
       body = `\`\`\`\n${r.output.length > 20000 ? r.output.substring(0, 20000) + '\n// ... (已截断)' : r.output}\n\`\`\``;
     } else if (r.name === 'search_code' || r.name === 'list_files') {
@@ -586,19 +586,56 @@ function executeDeleteFile(rootPath: string, args: Record<string, string>): Tool
   return { name: 'delete_file', arguments: args, success: true, output: `文件已删除: ${args.path}` };
 }
 
+/** 简单命令行分词（支持双/单引号），返回 null 表示引号未闭合 */
+function tokenizeCommandLine(cmd: string): string[] | null {
+  const argv: string[] = [];
+  let cur = '';
+  let quote: string | null = null;
+  for (const ch of cmd) {
+    if (quote) {
+      if (ch === quote) { quote = null; } else { cur += ch; }
+    } else if (ch === '"' || ch === "'") {
+      quote = ch;
+    } else if (ch === ' ' || ch === '\t') {
+      if (cur) { argv.push(cur); cur = ''; }
+    } else {
+      cur += ch;
+    }
+  }
+  if (quote) return null;
+  if (cur) argv.push(cur);
+  return argv;
+}
+
 function executeCommand(_args: Record<string, string>, rootPath?: string): ToolResult {
-  const cmd = _args.cmd;
-  if (!cmd) return { name: 'execute_command', arguments: _args, success: false, output: '缺少命令' };
+  const fail = (output: string): ToolResult => ({ name: 'execute_command', arguments: _args, success: false, output });
+  const raw = (_args.cmd || '').trim();
+  if (!raw) return fail('缺少命令');
+  // 不经 shell、直接以参数列表执行：拒绝控制字符与 shell 元字符（管道/重定向/串联等）
+  if (/[\u0000-\u001f\u007f]/.test(raw)) return fail('命令无效：不允许控制字符');
+  if (/[|&<>;`$]/.test(raw)) return fail('命令无效：不支持管道、重定向、串联等 shell 语法，请拆分为多个简单命令');
+  const argv = tokenizeCommandLine(raw);
+  if (!argv || argv.length === 0) return fail('命令无效：引号未闭合');
+  const restArgs = argv.slice(1);
+  const execOpts = { encoding: 'utf-8' as BufferEncoding, timeout: 30000, maxBuffer: 500 * 1024, cwd: rootPath || undefined, windowsHide: true };
   try {
-    const { execSync } = require('child_process');
-    const output = execSync(cmd, {
-      encoding: 'utf-8', timeout: 30000, maxBuffer: 500 * 1024,
-      cwd: rootPath || undefined,  // 限定工作目录为工程根目录
-      windowsHide: true,
-    });
+    const { execFileSync } = require('child_process');
+    let output: string;
+    // 白名单：仅允许以下固定程序，其余一律拒绝（不可信程序选择防护）
+    switch (argv[0]) {
+      case 'git': output = execFileSync('git', restArgs, execOpts); break;
+      case 'node': output = execFileSync('node', restArgs, execOpts); break;
+      case 'npm': output = execFileSync('npm', restArgs, execOpts); break;
+      case 'npx': output = execFileSync('npx', restArgs, execOpts); break;
+      case 'tsc': output = execFileSync('tsc', restArgs, execOpts); break;
+      case 'python': output = execFileSync('python', restArgs, execOpts); break;
+      case 'py': output = execFileSync('py', restArgs, execOpts); break;
+      case 'pip': output = execFileSync('pip', restArgs, execOpts); break;
+      default: return fail(`不允许执行程序: ${argv[0]}（白名单: git, node, npm, npx, tsc, python, py, pip）`);
+    }
     return { name: 'execute_command', arguments: _args, success: true, output: output || '(无输出)' };
   } catch (error: any) {
-    return { name: 'execute_command', arguments: _args, success: false, output: error.stderr || error.message || '命令执行失败' };
+    return fail(error.stderr || error.message || '命令执行失败');
   }
 }
 
@@ -623,7 +660,7 @@ async function executeWriteDocx(rootPath: string, args: Record<string, string>):
   if (!fp) return { name: 'write_docx', arguments: args, success: false, output: `越权路径: ${args.path}` };
   const markdown = args.content || '';
   try {
-    const { Document, Packer, Paragraph, TextRun, HeadingLevel } = require('docx');
+    const { Document, Packer, Paragraph, TextRun, HeadingLevel, LevelFormat, AlignmentType } = require('docx');
 
     const children: any[] = [];
     const lines = markdown.split('\n');
@@ -651,7 +688,7 @@ async function executeWriteDocx(rootPath: string, args: Record<string, string>):
           bullet: { level: 0 },
         }));
       } else if (/^\d+\.\s/.test(line)) {
-        // 有序列表
+        // 有序列表（numbering 引用需在 Document 中定义，见下方 config）
         const text = line.replace(/^\d+\.\s/, '');
         children.push(new Paragraph({ text, numbering: { reference: 'default-ol' } }));
       } else {
@@ -661,6 +698,21 @@ async function executeWriteDocx(rootPath: string, args: Record<string, string>):
     }
 
     const doc = new Document({
+      numbering: {
+        config: [
+          {
+            reference: 'default-ol',
+            levels: [
+              {
+                level: 0,
+                format: LevelFormat.DECIMAL,
+                text: '%1.',
+                alignment: AlignmentType.START,
+              },
+            ],
+          },
+        ],
+      },
       sections: [{ properties: {}, children }],
     });
 
@@ -777,59 +829,27 @@ async function executeReadPdf(rootPath: string, args: Record<string, string>): P
     {
       name: 'Python + PyPDF2',
       fn: async () => {
-        const { execSync } = require('child_process');
-        const pyScript = `from PyPDF2 import PdfReader
-r = PdfReader(r"""${fp}""")
+        const { execFileSync } = require('child_process');
+        const os = require('os');
+        // 文件路径经 argv 传入（参数列表），不嵌入脚本字符串
+        const pyScript = `import sys
+from PyPDF2 import PdfReader
+r = PdfReader(sys.argv[1])
 print(''.join([p.extract_text() or '' for p in r.pages]))
 `;
-        const tmpPy = path.join(rootPath, '.ai-temp-outputs', '_pdf_pypdf2.py');
-        if (!fs.existsSync(path.dirname(tmpPy))) fs.mkdirSync(path.dirname(tmpPy), { recursive: true });
+        // 临时脚本写入系统临时目录，避免污染用户工作区
+        const tmpPy = path.join(os.tmpdir(), `cody_pdf_${Date.now()}_${Math.random().toString(36).slice(2)}.py`);
         fs.writeFileSync(tmpPy, pyScript, 'utf-8');
         try {
-          const out = execSync(`python "${tmpPy}"`, {
+          const out = execFileSync('python', [tmpPy, fp], {
             encoding: 'utf-8', timeout: 60000, maxBuffer: 10 * 1024 * 1024,
             windowsHide: true,
           });
-          try { fs.unlinkSync(tmpPy); } catch {}
           return out || null;
         } catch {
-          try { fs.unlinkSync(tmpPy); } catch {}
           return null;
-        }
-      },
-    },
-    {
-      name: 'Python + pikepdf',
-      fn: async () => {
-        const { execSync } = require('child_process');
-        const pyScript = `from pikepdf import Pdf
-pdf = Pdf.open(r"""${fp}""")
-print(f"共{len(pdf.pages)}页")
-for i, page in enumerate(pdf.pages):
-    print(f"\\n=== 第{i+1}页 ===")
-    # 提取页面文本流
-    try:
-        for key in page.keys():
-            if '/Contents' in str(key) or 'Text' in str(key):
-                pass
-    except:
-        pass
-`;
-        const tmpPy = path.join(rootPath, '.ai-temp-outputs', '_pdf_pikepdf.py');
-        if (!fs.existsSync(path.dirname(tmpPy))) fs.mkdirSync(path.dirname(tmpPy), { recursive: true });
-        fs.writeFileSync(tmpPy, pyScript, 'utf-8');
-        try {
-          const out = execSync(`python "${tmpPy}"`, {
-            encoding: 'utf-8', timeout: 60000, maxBuffer: 10 * 1024 * 1024,
-            windowsHide: true,
-          });
+        } finally {
           try { fs.unlinkSync(tmpPy); } catch {}
-          // 如果只有页数没有实际内容，视为失败
-          const contentPart = out.replace(/共\d+页/, '').trim();
-          return contentPart.length > 20 ? out : null;
-        } catch {
-          try { fs.unlinkSync(tmpPy); } catch {}
-          return null;
         }
       },
     },

@@ -1,9 +1,7 @@
 .vscode/**
 .vscode-test/**
 .gitignore
-node_modules/
 src/**
 tsconfig.json
-skills/**
 .git/**
 *.vsix

@@ -82,6 +82,8 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
   private agentRunning = false;
   private agentPaused = false;
   private agentStopped = false;
+  /** 运行代际：每次新任务 +1，旧循环发现代际不匹配立即退出（防并发竞态） */
+  private runId = 0;
   private pendingApprovalResolve: ((approved: boolean) => void) | null = null;
   /** 临时文件追踪 */
   private tempFiles: Set<string> = new Set();
@@ -233,6 +235,8 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
       this.trimChatHistory();
     }
 
+    // 新任务代际 +1：旧循环的 runId 不匹配后会立即退出
+    const runId = ++this.runId;
     this.cancelStreaming();
     this.agentRunning = true;
     this.agentPaused = false;
@@ -244,7 +248,7 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
 
     try {
       if (mode === 'agent') {
-        await this.runAgentLoop();
+        await this.runAgentLoop(runId);
       } else {
         await this.runAssistantRequest();
       }
@@ -252,12 +256,15 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
       if ((error as Error).message === '请求已被取消') { return; }
       this.postMessage('streamError', { content: `请求失败: ${(error as Error).message}` });
     } finally {
-      this.agentRunning = false;
-      this.agentPaused = false;
-      // 确保 webview 退出 streaming 状态（正常结束或异常均走到这里）
-      this.postMessage('streamEnd', {});
-      this.postMessage('agentStatus', { running: false, paused: false });
-      await this.collapseLongMessages();
+      // 只有仍是当前任务时才重置 UI 状态（旧任务的 finally 不得影响新任务）
+      if (runId === this.runId) {
+        this.agentRunning = false;
+        this.agentPaused = false;
+        // 确保 webview 退出 streaming 状态（正常结束或异常均走到这里）
+        this.postMessage('streamEnd', {});
+        this.postMessage('agentStatus', { running: false, paused: false });
+        await this.collapseLongMessages();
+      }
     }
   }
 
@@ -278,7 +285,7 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
   }
 
   /** Agent 循环：工具调用 → 执行 → 结果反馈 → 继续 */
-  private async runAgentLoop(): Promise<void> {
+  private async runAgentLoop(runId: number): Promise<void> {
     const skillsPrompt = this.skillManager.buildSkillsPrompt();
     const agentSysMsg = buildAgentSystemPrompt(skillsPrompt);
     let round = 0;
@@ -289,6 +296,8 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
     let roundsSinceTodo = 0;
 
     while (round < Settings.maxAgentRounds) {
+      // 被新任务取代（runId 不匹配）→ 立即退出，不触碰任何共享状态
+      if (runId !== this.runId) return;
       // 检查暂停/停止状态
       if (this.agentStopped) {
         this.agentStopped = false;
@@ -296,6 +305,7 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
       }
       while (this.agentPaused) {
         await this.delay(200);
+        if (runId !== this.runId) return;
         if (this.agentStopped) {
           this.agentStopped = false;
           return;
@@ -330,8 +340,11 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
       } catch (streamError) {
         const msg = (streamError as Error).message;
         if (msg === '请求已被取消') {
-          // 取消后检查标记：如果只是暂停则继续循环，停止则由外层处理
-          if (this.agentStopped) { return; }
+          // 被新任务取代：不触碰 agentStopped 等共享状态，直接退出
+          if (runId !== this.runId) return;
+          // 停止：由用户显式触发，重置标记后退出
+          if (this.agentStopped) { this.agentStopped = false; return; }
+          // 仅暂停：继续循环，外层 while(this.agentPaused) 会等待恢复
           continue;
         }
         throw streamError;
@@ -400,7 +413,8 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
       const hasDangerous = toolCalls.some(tc => isDangerous(tc.name));
       const hasWrite = toolCalls.some(tc => tc.name === 'write_file' || tc.name === 'delete_file');
 
-      if (editMode === 'normal' && hasWrite) {
+      // 一般模式：写入类或危险类工具（execute_command 等）均需审批；fast 模式免审
+      if (editMode === 'normal' && (hasWrite || hasDangerous)) {
         // 一般模式 → 发送审批请求
         this.postMessage('showApproval', {
           toolCalls: toolCalls.map(tc => ({
@@ -411,6 +425,7 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
         });
 
         const approved = await this.waitForApproval();
+        if (runId !== this.runId) return;
         if (!approved) {
           this.postMessage('agentToolResult', { content: '⏸️ 编辑操作已取消。' });
           this.agentHistory.push({ role: 'assistant', content: '用户取消了编辑操作。' });
@@ -418,7 +433,7 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
         }
       }
 
-      // 危险操作提示
+      // 危险操作提示（fast 模式下也会执行到此）
       if (hasDangerous) {
         this.postMessage('agentToolResult', { content: '⚠️ **检测到危险操作，正在执行...**' });
       }
@@ -436,6 +451,9 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
       // 执行工具
       const results: ToolResult[] = [];
       for (const tc of toolCalls) {
+        // 执行每个工具前检查代际（新任务到来时立即停止旧任务的操作）
+        if (runId !== this.runId) return;
+
         // 重复操作检测（v1.3 熔断机制）
         const argKey = `${tc.name}:${JSON.stringify(tc.arguments)}`;
         if (argKey === lastToolKey) {
@@ -625,9 +643,15 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
   private async writeTempFile(msg: ChatMessage): Promise<string | null> {
     if (!this.tempDir) return null;
     try {
-      const ts = new Date().toISOString().replace(/[:.]/g, '-');
+      // 文件名仅由固定前缀 + 时间戳构成
+      const ts = new Date().toISOString().replace(/[^\w.\-]/g, '-');
       const filename = `ai-output-${ts}.md`;
-      const filePath = path.join(this.tempDir, filename);
+      // 文件名白名单：仅允许固定前缀 + 安全字符（杜绝 ../ 等路径构造）
+      if (!/^ai-output-[\w.\-]+\.md$/.test(filename)) return null;
+      const tempRoot = path.resolve(this.tempDir);
+      const filePath = path.resolve(tempRoot, filename);
+      // 根目录边界校验：解析后的路径必须仍位于临时目录内
+      if (filePath !== tempRoot && !filePath.startsWith(tempRoot + path.sep)) return null;
       fs.writeFileSync(filePath, msg.content, 'utf-8');
       this.tempFiles.add(filePath);
       return filePath;
@@ -665,6 +689,8 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
     if (contextMessages) this.agentHistory = [...contextMessages];
     this.postMessage('addMessage', { role: 'user', content: prompt });
     this.agentHistory.push({ role: 'user', content: prompt });
+    // 新任务代际 +1 并中断正在运行的旧任务
+    const runId = ++this.runId;
     this.cancelStreaming();
     this.agentRunning = true;
     this.agentPaused = false;
@@ -679,15 +705,18 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
         (chunk) => { full += chunk; this.postMessage('streamChunk', { content: chunk }); },
         this.abortController.signal
       );
+      if (runId !== this.runId) return;
       if (full) this.agentHistory.push({ role: 'assistant', content: full });
       this.postMessage('streamEnd', {});
     } catch (error) {
       if ((error as Error).message === '请求已被取消') return;
       this.postMessage('streamError', { content: `失败: ${(error as Error).message}` });
     } finally {
-      this.agentRunning = false;
-      this.agentPaused = false;
-      this.postMessage('agentStatus', { running: false, paused: false });
+      if (runId === this.runId) {
+        this.agentRunning = false;
+        this.agentPaused = false;
+        this.postMessage('agentStatus', { running: false, paused: false });
+      }
     }
   }
 
@@ -795,9 +824,17 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
     });
   }
 
-  /** 外部（补全 Provider）报告补全请求触发 */
+  /** 外部（补全 Engine）报告补全请求触发 */
   reportCompRequest(): void {
     this.stats.compRequests++;
+    this.sendTokenStats();
+  }
+
+  /** 外部（补全 Engine）报告补全 token 用量 */
+  reportCompTokens(promptTokens: number, completionTokens: number): void {
+    this.stats.compPromptTokens += promptTokens;
+    this.stats.compCompletionTokens += completionTokens;
+    this.sendTokenStats();
   }
 
   /** 获取 stats 供外部读取 */

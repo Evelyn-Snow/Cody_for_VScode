@@ -2,16 +2,16 @@
   "name": "cody-for-vscode",
   "displayName": "Cody for VSCode",
   "description": "Cody — 内嵌 VSCode 的 AI 编程助手，支持 Assistant 单次问答与 Agent 长对话工具调用",
-  "version": "0.1.1-build.4",
+  "version": "0.1.1-build.5",
   "publisher": "cody",
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/QianQiuXue-Snow/Cody_for_VScode"
+    "url": "https://github.com/Evelyn-Snow/Cody_for_VScode"
   },
-  "homepage": "https://github.com/QianQiuXue-Snow/Cody_for_VScode#readme",
+  "homepage": "https://github.com/Evelyn-Snow/Cody_for_VScode#readme",
   "bugs": {
-    "url": "https://github.com/QianQiuXue-Snow/Cody_for_VScode/issues"
+    "url": "https://github.com/Evelyn-Snow/Cody_for_VScode/issues"
   },
   "engines": {
     "vscode": "^1.63.0"
@@ -169,7 +169,55 @@
         "aiAssistant.completionDebounceMs": {
           "type": "number",
           "default": 500,
-          "description": "代码补全的防抖延迟（毫秒）",
+          "description": "代码补全的防抖延迟（毫秒，停止输入多久后发起请求）",
+          "order": 16
+        },
+        "aiAssistant.completionMinPrefix": {
+          "type": "number",
+          "default": 2,
+          "minimum": 1,
+          "maximum": 8,
+          "description": "补全触发的最小前缀字符数（低于此长度不请求 AI）",
+          "order": 16
+        },
+        "aiAssistant.completionContextBeforeChars": {
+          "type": "number",
+          "default": 800,
+          "minimum": 100,
+          "maximum": 8000,
+          "description": "补全上下文窗口：光标前最多取多少字符",
+          "order": 16
+        },
+        "aiAssistant.completionContextAfterChars": {
+          "type": "number",
+          "default": 80,
+          "minimum": 0,
+          "maximum": 2000,
+          "description": "补全上下文窗口：光标后最多取多少字符",
+          "order": 16
+        },
+        "aiAssistant.completionMaxTokens": {
+          "type": "number",
+          "default": 128,
+          "minimum": 16,
+          "maximum": 1024,
+          "description": "补全单次请求的最大输出 token 数（硬上限，防止一次生成一大段）",
+          "order": 16
+        },
+        "aiAssistant.completionMaxLines": {
+          "type": "number",
+          "default": 5,
+          "minimum": 1,
+          "maximum": 30,
+          "description": "补全结果最多保留的行数（超出截断，防止一次写太多多余代码）",
+          "order": 16
+        },
+        "aiAssistant.completionTemperature": {
+          "type": "number",
+          "default": 0.1,
+          "minimum": 0,
+          "maximum": 2,
+          "description": "补全专用 temperature（低于对话温度，结果更稳定、更少幻觉）",
           "order": 16
         },
         "aiAssistant.chatSystemPrompt": {

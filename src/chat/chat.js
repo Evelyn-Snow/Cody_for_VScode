@@ -463,7 +463,12 @@ function removeTypingPlaceholder() {
 }
 
 function showError(errorText) {
-  errorContainer.innerHTML = '<div class="error-message">' + errorText + '</div>';
+  // 用 textContent 防止 API 错误信息中的 HTML 注入
+  errorContainer.innerHTML = '';
+  var errDiv = document.createElement('div');
+  errDiv.className = 'error-message';
+  errDiv.textContent = errorText;
+  errorContainer.appendChild(errDiv);
 }
 
 function hideError() {
@@ -1123,8 +1128,17 @@ function showSettingsMessage(type, text) {
   var borderColor = type === 'success'
     ? 'var(--vscode-inputValidation-infoBorder)'
     : 'var(--vscode-inputValidation-errorBorder)';
-  settingsMessages.innerHTML = '<div style="background:' + bgColor + ';color:' + fgColor +
-    ';border:1px solid ' + borderColor + ';border-radius:6px;padding:6px 10px;font-size:11px;text-align:center;">' + text + '</div>';
+  settingsMessages.innerHTML = '';
+  var msgDiv = document.createElement('div');
+  msgDiv.style.background = bgColor;
+  msgDiv.style.color = fgColor;
+  msgDiv.style.border = '1px solid ' + borderColor;
+  msgDiv.style.borderRadius = '6px';
+  msgDiv.style.padding = '6px 10px';
+  msgDiv.style.fontSize = '11px';
+  msgDiv.style.textAlign = 'center';
+  msgDiv.textContent = text;
+  settingsMessages.appendChild(msgDiv);
   settingsSave.disabled = false;
 }
 

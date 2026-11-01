@@ -51,6 +51,34 @@ export type ChatTokenCallback = (
   completionTokens: number
 ) => void;
 
+/** 提供商返回的单次请求用量（OpenAI 兼容 usage 字段） */
+export interface TokenUsage {
+  promptTokens: number;
+  completionTokens: number;
+  /** 缓存命中的输入 token（prompt_tokens_details.cached_tokens，部分提供商支持） */
+  cachedPromptTokens?: number;
+}
+
+/** 解析 OpenAI 兼容 usage；无法识别返回 null */
+function normalizeUsage(raw: any): TokenUsage | null {
+  if (!raw || typeof raw.prompt_tokens !== 'number') return null;
+  const u: TokenUsage = {
+    promptTokens: raw.prompt_tokens,
+    completionTokens: typeof raw.completion_tokens === 'number' ? raw.completion_tokens : 0,
+  };
+  const cached = raw.prompt_tokens_details?.cached_tokens
+    ?? raw.cached_tokens
+    ?? raw.prompt_cache_hit_tokens; // DeepSeek 兼容
+  if (typeof cached === 'number') u.cachedPromptTokens = cached;
+  return u;
+}
+
+/** 非流式请求结果：内容 + 提供商用量（不支持时为 null） */
+export interface CompletionResult {
+  content: string;
+  usage: TokenUsage | null;
+}
+
 /**
  * 估算 token 数（混合中英文）
  */
@@ -58,7 +86,8 @@ export function estimateTokens(text: string): number {
   let cn = 0, en = 0;
   for (const ch of text) {
     if (/[\u4e00-\u9fff\u3000-\u303f\uff00-\uffef]/.test(ch)) { cn++; }
-    else if (ch !== ' ' && ch !== '\n' && ch !== '\r' && ch !== '\t') { en++; }
+    // 空格/Tab 参与计费（缩进也是 token），仅换行忽略
+    else if (ch !== '\n' && ch !== '\r') { en++; }
   }
   return Math.max(1, Math.round(cn / 1.5 + en / 4));
 }
@@ -134,7 +163,9 @@ export class OpenAIClient {
     expectStream: boolean,
     onChunk?: StreamChunkCallback,
     abortSignal?: AbortSignal,
-    timeoutMs: number = 30000
+    timeoutMs: number = 30000,
+    onUsage?: (u: TokenUsage) => void,
+    onReasoning?: (s: string) => void
   ): Promise<string> {
     const url = this.buildUrl(baseUrl, endpoint);
     const isHttps = url.protocol === 'https:';
@@ -171,6 +202,10 @@ export class OpenAIClient {
             }
             try {
               const resp = JSON.parse(data);
+              if (onUsage && resp.usage) {
+                const u = normalizeUsage(resp.usage);
+                if (u) onUsage(u);
+              }
               const content = resp.choices?.[0]?.message?.content;
               if (!content) { reject(new Error('API 返回的内容为空')); return; }
               resolve(content);
@@ -203,8 +238,15 @@ export class OpenAIClient {
             if (data === '[DONE]') continue;
             try {
               const parsed = JSON.parse(data);
-              const c = parsed.choices?.[0]?.delta?.content;
+              if (onUsage && parsed.usage) {
+                const u = normalizeUsage(parsed.usage);
+                if (u) onUsage(u);
+              }
+              const delta = parsed.choices?.[0]?.delta;
+              const c = delta?.content;
               if (c && onChunk) onChunk(c);
+              const rc = delta?.reasoning_content ?? delta?.reasoning ?? delta?.thinking;
+              if (rc && onReasoning) onReasoning(rc);
             } catch {}
           }
         });
@@ -214,8 +256,15 @@ export class OpenAIClient {
             if (t.startsWith('data: ') && t.slice(6) !== '[DONE]') {
               try {
                 const parsed = JSON.parse(t.slice(6));
-                const c = parsed.choices?.[0]?.delta?.content;
+                if (onUsage && parsed.usage) {
+                  const u = normalizeUsage(parsed.usage);
+                  if (u) onUsage(u);
+                }
+                const delta = parsed.choices?.[0]?.delta;
+                const c = delta?.content;
                 if (c && onChunk) onChunk(c);
+                const rc = delta?.reasoning_content ?? delta?.reasoning ?? delta?.thinking;
+                if (rc && onReasoning) onReasoning(rc);
               } catch {}
             }
           }
@@ -245,7 +294,7 @@ export class OpenAIClient {
   /**
    * 非流式请求 — 补全用（禁用思考模式）
    */
-  private async completionRequest(request: ChatCompletionRequest): Promise<string> {
+  private async completionRequest(request: ChatCompletionRequest, signal?: AbortSignal): Promise<CompletionResult> {
     const bodyObj: Record<string, any> = {
       model: request.model,
       messages: request.messages,
@@ -256,8 +305,9 @@ export class OpenAIClient {
     };
     const thinkBody = this.buildThinkingBody(this.compThinkFmt, false);
     if (thinkBody) Object.assign(bodyObj, thinkBody);
-    const result = await this.httpPost(this.compBaseUrl, this.compApiKey, 'chat/completions', bodyObj, false, undefined, undefined, 15000);
-    return result;
+    const usageRef: { value: TokenUsage | null } = { value: null };
+    const result = await this.httpPost(this.compBaseUrl, this.compApiKey, 'chat/completions', bodyObj, false, undefined, signal, 15000, (u) => { usageRef.value = u; });
+    return { content: result, usage: usageRef.value };
   }
 
   /**
@@ -274,24 +324,43 @@ export class OpenAIClient {
       max_tokens: request.max_tokens ?? 2048,
       temperature: request.temperature ?? 0.7,
       stream: true,
+      stream_options: { include_usage: true },
       stop: request.stop,
     };
     const thinkBody = this.buildThinkingBody(this.chatThinkFmt, this.chatThink);
     if (thinkBody) Object.assign(bodyObj, thinkBody);
-    // 包装回调以累积完整输出
+    // 包装回调以累积完整输出（思考内容供无 usage 时回退估算）
     let full = '';
+    let reasoning = '';
+    const usageRef: { value: TokenUsage | null } = { value: null };
     const wrappedChunk: StreamChunkCallback = (content) => {
       full += content;
       onChunk(content);
     };
-    await this.httpPost(this.chatBaseUrl, this.chatApiKey, 'chat/completions', bodyObj, true, wrappedChunk, abortSignal, 60000);
-    // 触发 token 统计：系统 Prompt = 可缓存，其余消息 = 未缓存
-    if (this._onTokenCount) {
-      const sysMsg = request.messages.find(m => m.role === 'system');
-      const nonSysText = request.messages.filter(m => m.role !== 'system').map(m => m.content).join('');
-      const cached = sysMsg ? estimateTokens(sysMsg.content) : 0;
-      const uncached = estimateTokens(nonSysText);
-      this._onTokenCount(cached, uncached, estimateTokens(full));
+    try {
+      await this.httpPost(
+        this.chatBaseUrl, this.chatApiKey, 'chat/completions', bodyObj, true,
+        wrappedChunk, abortSignal, 60000,
+        (u) => { usageRef.value = u; },
+        (r) => { reasoning += r; }
+      );
+    } finally {
+      // 无论成功、取消还是失败，本次请求的消耗都要入账：
+      // 优先用提供商返回的真实 usage，取不到再回退本地估算
+      if (this._onTokenCount) {
+        const sysMsg = request.messages.find(m => m.role === 'system');
+        const nonSysText = request.messages.filter(m => m.role !== 'system').map(m => m.content).join('');
+        const sysEst = sysMsg ? estimateTokens(sysMsg.content) : 0;
+        const usage = usageRef.value;
+        if (usage) {
+          const cached = usage.cachedPromptTokens !== undefined
+            ? usage.cachedPromptTokens
+            : Math.min(sysEst, usage.promptTokens);
+          this._onTokenCount(cached, usage.promptTokens - cached, usage.completionTokens);
+        } else {
+          this._onTokenCount(sysEst, estimateTokens(nonSysText), estimateTokens(full + reasoning));
+        }
+      }
     }
   }
 
@@ -299,7 +368,7 @@ export class OpenAIClient {
 
   /** @deprecated 使用 completionRequest */
   async chatCompletion(request: ChatCompletionRequest): Promise<string> {
-    return this.completionRequest(request);
+    return (await this.completionRequest(request)).content;
   }
 
   /** @deprecated 使用 chatStreamRequest */
@@ -313,14 +382,26 @@ export class OpenAIClient {
 
   /**
    * 构建代码补全 Prompt
+   *
+   * 旧版用 `<FILL_HERE>` 文本标记，chat 模型不理解该格式，容易复述上下文、
+   * 输出整段无关代码。现改为显式指令 + 游标标记，并明确行数上限。
    */
   buildCompletionPrompt(codeBefore: string, codeAfter: string, language: string): ChatMessage[] {
     // 更小上下文 → 更快推理
     const truncBefore = codeBefore.length > 300 ? codeBefore.slice(-300) : codeBefore;
     const truncAfter = codeAfter.length > 80 ? codeAfter.slice(0, 80) : codeAfter;
 
-    const systemPrompt = `只输出补全代码。`;
-    const userPrompt = `${truncBefore}<FILL_HERE>${truncAfter}`;
+    const systemPrompt = [
+      '你是一个代码补全引擎。你的唯一任务是在光标处续写代码。',
+      '严格遵守以下规则：',
+      `1. 只输出需要插入的续写代码，最多 ${Settings.completionMaxLines} 行，在语义完整处尽早结束；`,
+      '2. 不要重复上下文中已存在的任何代码（包括光标前和光标后的内容）；',
+      '3. 光标后若已有右括号、右大括号、引号、分号等配对符号，不要重复输出它们；',
+      '4. 光标后已有区域边界（右括号、右大括号、右引号等）时，补全必须完整落在边界之内，不要越过边界；',
+      '5. 不要输出 Markdown 代码块标记、解释说明或任何多余文本；',
+      '6. 严格保持光标处的缩进和代码风格。',
+    ].join('\n');
+    const userPrompt = `在 <|CURSOR|> 处续写 ${language} 代码，只输出续写部分：\n\n<|BEFORE|>\n${truncBefore}\n<|CURSOR|>\n${truncAfter}\n<|AFTER|>`;
 
     return [
       { role: 'system', content: systemPrompt },
@@ -329,22 +410,22 @@ export class OpenAIClient {
   }
 
   /**
-   * 代码补全请求
+   * 代码补全请求（signal 用于在用户继续输入时真正中止底层 HTTP 请求）
    */
   async getCompletion(
     codeBefore: string,
     codeAfter: string,
-    language: string
-  ): Promise<string> {
+    language: string,
+    signal?: AbortSignal
+  ): Promise<CompletionResult> {
     const messages = this.buildCompletionPrompt(codeBefore, codeAfter, language);
 
-    return this.chatCompletion({
+    return this.completionRequest({
       model: Settings.completionModel,
       messages,
-      max_tokens: Settings.maxTokens,
-      temperature: Settings.temperature,
-      // 不设 stop：让模型自然结束，多行代码块不会被打断
-    });
+      max_tokens: Settings.completionMaxTokens,
+      temperature: Settings.completionTemperature,
+    }, signal);
   }
 
   /**

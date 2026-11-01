@@ -1,87 +1,110 @@
 import * as vscode from 'vscode';
-import { openAIClient } from '../api/openaiClient';
 import { Settings } from '../config/settings';
-import { cleanCompletion } from './completionCleaner';
-import { ChatPanelProvider } from '../chat/chatPanel';
+import { CompletionEngine, getWordStart, getCurrentPrefix } from './completionEngine';
 
 /**
- * 下拉补全 Provider（本地毫秒出 + 后台 AI 无缝替换）
+ * 下拉补全 Provider（本地毫秒出 + 后台 AI 填充）
  *
- * 请求管理：
- * - aiGeneration：每次新前缀触发时 +1，旧请求完成时比对过期则丢弃
- * - pendingAiPrefix：防止同一前缀重复请求
- * - lastAiPrefix：防止无限重新触发下拉循环
+ * 相比旧实现：
+ * - 不再用「AI 完成后 triggerSuggest 重新弹出」的 hack，改用
+ *   resolveCompletionItem 懒解析：占位项显示时由 VSCode 主动 resolve，
+ *   完成后原地填充 label / insertText / documentation；
+ * - AI 缓存由 CompletionEngine 按 (URI, 单词起点) 键控，修复旧版
+ *   仅按前缀缓存导致的跨文件串味；
+ * - 与 inline Provider 共享单飞请求，不重复打 API。
  */
-export class DropdownCompletionProvider implements vscode.CompletionItemProvider {
-  private aiCache = new Map<string, vscode.CompletionItem[]>();
-  private pendingAiPrefix: string | null = null;
-  private aiGeneration = 0;
-  private lastAiPrefix: string | null = null;
-  private lastAiPrefixTimer: ReturnType<typeof setTimeout> | undefined;
+const AI_PLACEHOLDER = 'cody-ai-pending';
 
-  async provideCompletionItems(
+interface PlaceholderData {
+  type: string;
+  uri: string;
+  /** 纯 JSON 结构：{line, character}，避免跨序列化携带 vscode.Position 实例 */
+  position: { line: number; character: number };
+  wordStart: { line: number; character: number };
+  prefix: string;
+  language: string;
+}
+
+export class DropdownCompletionProvider implements vscode.CompletionItemProvider {
+  constructor(private engine: CompletionEngine) {}
+
+  provideCompletionItems(
     document: vscode.TextDocument,
     position: vscode.Position,
-    token: vscode.CancellationToken,
+    _token: vscode.CancellationToken,
     _context: vscode.CompletionContext
-  ): Promise<vscode.CompletionItem[] | vscode.CompletionList> {
+  ): vscode.CompletionItem[] {
     if (!Settings.enableCompletion || !Settings.isDropdownMode) {
       return [];
     }
 
-    const prefix = this.getPrefix(document, position);
-    if (prefix.length < 2) return [];
+    const wordStart = getWordStart(document, position);
+    const prefix = getCurrentPrefix(document, position, wordStart);
+    if (prefix.length < Settings.completionMinPrefix) return [];
 
-    // 1. 本地补全（始终返回）
+    // 1. 本地匹配（始终返回）
     const localItems = this.getLocalMatches(document, position, prefix);
 
-    // 2. AI 缓存命中 → 直接返回
-    const aiItems = this.aiCache.get(prefix);
-    if (aiItems) {
-      ChatPanelProvider.instance?.reportCompRequest();
-      const result = [...aiItems];
-      if (localItems.length > 0) {
-        const sep = new vscode.CompletionItem('- 本地匹配 -', vscode.CompletionItemKind.Text);
-        sep.sortText = '~local';
-        sep.preselect = false;
-        result.push(sep);
-        result.push(...localItems);
-      }
-      return result;
+    // 2. AI 缓存命中 → 直接返回（与 inline 共享同一缓存）
+    const cached = this.engine.getCached(document, position);
+    if (cached !== null) {
+      const aiItem = this.makeAiItem(cached, prefix, wordStart, position, document.languageId);
+      return [aiItem, ...this.withLocalSeparator(localItems)];
     }
 
-    // 3. 启动后台 AI
-    this.startBackgroundAi(document, position, prefix);
+    // 3. 未命中 → 本地结果 + AI 占位（resolve 时懒加载）
+    const placeholder = new vscode.CompletionItem('⏳ AI 生成中...', vscode.CompletionItemKind.Event);
+    placeholder.sortText = '!ai-loading';
+    placeholder.preselect = false;
+    placeholder.detail = '后台 AI 正在生成补全';
+    // 占位期间被接受时：以当前前缀替换自身（等价于无操作）
+    placeholder.insertText = new vscode.SnippetString(prefix);
+    placeholder.range = new vscode.Range(wordStart, position);
+    placeholder.filterText = prefix;
+    // data 属性 VSCode 1.65+ 才有，用 any 兼容旧版类型定义
+    (placeholder as any).data = {
+      type: AI_PLACEHOLDER,
+      uri: document.uri.toString(),
+      position: { line: position.line, character: position.character },
+      wordStart: { line: wordStart.line, character: wordStart.character },
+      prefix,
+      language: document.languageId,
+    } as PlaceholderData;
 
-    // 4. 返回本地结果 + 加载中提示
-    if (localItems.length > 0) {
-      const loading = new vscode.CompletionItem('⏳ AI 生成中...', vscode.CompletionItemKind.Event);
-      loading.sortText = '!ai-loading';
-      loading.preselect = false;
-      loading.detail = '后台 AI 正在流式生成补全';
-      return [loading, ...localItems];
-    }
-    const loading = new vscode.CompletionItem('⏳ AI 生成中...', vscode.CompletionItemKind.Event);
-    loading.preselect = false;
-    loading.detail = '后台 AI 正在流式生成补全';
-    return [loading];
+    // 预热请求（防抖计时从现在开始；resolve 时会复用同一任务）
+    void this.engine.request(document, position);
+
+    return [placeholder, ...this.withLocalSeparator(localItems)];
   }
 
-  resolveCompletionItem(
+  async resolveCompletionItem(
     item: vscode.CompletionItem,
     _token: vscode.CancellationToken
-  ): vscode.ProviderResult<vscode.CompletionItem> {
+  ): Promise<vscode.CompletionItem> {
+    const data = (item as any).data as PlaceholderData | undefined;
+    if (!data || data.type !== AI_PLACEHOLDER) return item;
+
+    const doc = await this.findDocument(data.uri);
+    if (!doc) return item;
+
+    const position = new vscode.Position(data.position.line, data.position.character);
+    const wordStart = new vscode.Position(data.wordStart.line, data.wordStart.character);
+
+    const text = await this.engine.request(doc, position, { revive: false });
+    if (!text) return item; // 失败/取消/已失效 → 保持占位
+
+    const filled = this.makeAiItem(text, data.prefix, wordStart, position, data.language);
+    item.label = filled.label;
+    item.insertText = filled.insertText;
+    item.range = filled.range;
+    item.filterText = filled.filterText;
+    item.detail = filled.detail;
+    item.documentation = filled.documentation;
+    (item as any).data = undefined; // 防止重复 resolve
     return item;
   }
 
   // ===== 本地前缀匹配 =====
-
-  private getPrefix(document: vscode.TextDocument, position: vscode.Position): string {
-    const line = document.lineAt(position.line);
-    const text = line.text.substring(0, position.character);
-    const m = text.match(/(\w[\w.]*)$/);
-    return m ? m[1] : '';
-  }
 
   private getLocalMatches(
     document: vscode.TextDocument,
@@ -112,109 +135,48 @@ export class DropdownCompletionProvider implements vscode.CompletionItemProvider
     return items;
   }
 
-  // ===== 后台 AI（清洗升级） =====
+  // ===== UI 组装 =====
 
-  private startBackgroundAi(
-    document: vscode.TextDocument,
+  /** 构造最终 AI 补全项：insertText 为「前缀 + 续写」，range 覆盖整个单词 */
+  private makeAiItem(
+    text: string,
+    prefix: string,
+    wordStart: vscode.Position,
     position: vscode.Position,
-    prefix: string
-  ): void {
-    // 同一前缀不重复请求
-    if (this.pendingAiPrefix === prefix) return;
+    language: string
+  ): vscode.CompletionItem {
+    const full = prefix + text;
+    const label = full.length > 60
+      ? full.substring(0, 60).replace(/\n/g, '↵') + '…'
+      : full.replace(/\n/g, '↵');
 
-    // 新前缀 → 递增 generation，作废所有旧请求
-    this.pendingAiPrefix = prefix;
-    const gen = ++this.aiGeneration;
-    ChatPanelProvider.instance?.reportCompRequest();
-
-    const language = document.languageId || 'plaintext';
-
-    // 上下文：光标前 800 字符，光标后 80 字符
-    const beforeLen = Math.min(800, document.offsetAt(position));
-    const startPos = document.positionAt(document.offsetAt(position) - beforeLen);
-    const codeBefore = document.getText(new vscode.Range(startPos, position));
-
-    const afterLen = Math.min(80, document.getText().length - document.offsetAt(position));
-    const endPos = document.positionAt(document.offsetAt(position) + afterLen);
-    const codeAfter = document.getText(new vscode.Range(position, endPos));
-
-    (async () => {
-      try {
-        const completion = await openAIClient.getCompletion(codeBefore, codeAfter, language);
-
-        // 过期检测
-        if (gen !== this.aiGeneration) return;
-        this.pendingAiPrefix = null;
-
-        if (!completion || completion.trim().length === 0) return;
-
-        const cleaned = cleanCompletion(completion, codeBefore, codeAfter, language);
-        if (!cleaned) return;
-
-        // 二次过期检测
-        if (gen !== this.aiGeneration) return;
-
-        // 去掉 prefix 前缀（若模型输出含 prefix）
-        let final = cleaned;
-        if (final.toLowerCase().startsWith(prefix.toLowerCase())) {
-          final = final.slice(prefix.length);
-        }
-        final = final.trim();
-        if (!final) return;
-
-        const label = final.length > 60
-          ? final.substring(0, 60).replace(/\n/g, '↵') + '…'
-          : final.replace(/\n/g, '↵');
-
-        const item = new vscode.CompletionItem(label, vscode.CompletionItemKind.Snippet);
-        item.insertText = new vscode.SnippetString(final);
-        item.sortText = '!ai';
-        item.filterText = final;
-        item.detail = '🤖 AI 补全';
-        item.documentation = new vscode.MarkdownString(
-          `\`\`\`${language}\n${prefix}${final}\n\`\`\``
-        );
-
-        // 缓存
-        this.aiCache.set(prefix, [item]);
-        if (this.aiCache.size > 30) {
-          const first = this.aiCache.keys().next().value;
-          if (first) this.aiCache.delete(first);
-        }
-
-        // 循环保护
-        if (this.lastAiPrefix === prefix) return;
-        this.lastAiPrefix = prefix;
-        if (this.lastAiPrefixTimer) clearTimeout(this.lastAiPrefixTimer);
-        this.lastAiPrefixTimer = setTimeout(() => { this.lastAiPrefix = null; }, 2000);
-
-        // 光标位置校验
-        const editor = vscode.window.activeTextEditor;
-        if (!editor || editor.document !== document) return;
-        const currentPrefix = this.getPrefix(editor.document, editor.selection.active);
-        if (currentPrefix !== prefix) return;
-
-        await vscode.commands.executeCommand('editor.action.triggerSuggest');
-
-      } catch (error: any) {
-        if (error?.name === 'CompletionTimeout' || error?.message?.includes('超时')) {
-          // 超时静默
-        }
-        if (gen === this.aiGeneration) {
-          this.pendingAiPrefix = null;
-        }
-      }
-    })();
+    const item = new vscode.CompletionItem(label, vscode.CompletionItemKind.Snippet);
+    item.insertText = new vscode.SnippetString(full);
+    item.range = new vscode.Range(wordStart, position);
+    item.sortText = '!ai';
+    item.filterText = full;
+    item.detail = '🤖 AI 补全';
+    item.documentation = new vscode.MarkdownString(
+      `\`\`\`${language}\n${full}\n\`\`\``
+    );
+    return item;
   }
 
-  clearCache(): void {
-    this.aiCache.clear();
-    this.pendingAiPrefix = null;
-    this.aiGeneration++;
-    this.lastAiPrefix = null;
-    if (this.lastAiPrefixTimer) {
-      clearTimeout(this.lastAiPrefixTimer);
-      this.lastAiPrefixTimer = undefined;
+  private withLocalSeparator(localItems: vscode.CompletionItem[]): vscode.CompletionItem[] {
+    if (localItems.length === 0) return [];
+    const sep = new vscode.CompletionItem('- 本地匹配 -', vscode.CompletionItemKind.Text);
+    sep.sortText = '~local';
+    sep.preselect = false;
+    return [sep, ...localItems];
+  }
+
+  private async findDocument(uriStr: string): Promise<vscode.TextDocument | null> {
+    const open = vscode.workspace.textDocuments.find(d => d.uri.toString() === uriStr);
+    if (open) return open;
+    try {
+      return await vscode.workspace.openTextDocument(vscode.Uri.parse(uriStr));
+    } catch {
+      return null;
     }
   }
 }

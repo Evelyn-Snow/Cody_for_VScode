@@ -26,7 +26,7 @@
 
 ### 安装
 
-1. 下载最新 .vsix 文件（[Releases](https://github.com/QianQiuXue-Snow/Cody_for_VScode/releases)）
+1. 下载最新 .vsix 文件（[Releases](https://github.com/Evelyn-Snow/Cody_for_VScode/releases)）
 2. VSCode -> Ctrl+Shift+P -> Extensions: Install from VSIX... -> 选择文件
 3. 点击左侧 Cody 图标打开侧边栏 -> 进入设置配置 API
 

@@ -54,8 +54,8 @@ static get chatThinkingFormat(): 'minimax' | 'qwen' | 'ollama' | 'anthropic' | '
   /**
    * 补全思考模式参数格式
    */
-  static get completionThinkingFormat(): 'minimax' | 'qwen' | 'ollama' | 'none' {
-    return vscode.workspace.getConfiguration('aiAssistant').get<'minimax' | 'qwen' | 'ollama' | 'none'>('completionThinkingFormat', 'minimax');
+  static get completionThinkingFormat(): 'minimax' | 'qwen' | 'ollama' | 'anthropic' | 'none' {
+    return vscode.workspace.getConfiguration('aiAssistant').get<'minimax' | 'qwen' | 'ollama' | 'anthropic' | 'none'>('completionThinkingFormat', 'minimax');
   }
 
   /**
@@ -129,6 +129,48 @@ static get chatThinkingFormat(): 'minimax' | 'qwen' | 'ollama' | 'anthropic' | '
    */
   static get completionDebounceMs(): number {
     return vscode.workspace.getConfiguration('aiAssistant').get<number>('completionDebounceMs', 500);
+  }
+
+  /**
+   * 补全触发的最小前缀字符数
+   */
+  static get completionMinPrefix(): number {
+    return vscode.workspace.getConfiguration('aiAssistant').get<number>('completionMinPrefix', 2);
+  }
+
+  /**
+   * 补全上下文窗口：光标前字符数
+   */
+  static get completionContextBeforeChars(): number {
+    return vscode.workspace.getConfiguration('aiAssistant').get<number>('completionContextBeforeChars', 800);
+  }
+
+  /**
+   * 补全上下文窗口：光标后字符数
+   */
+  static get completionContextAfterChars(): number {
+    return vscode.workspace.getConfiguration('aiAssistant').get<number>('completionContextAfterChars', 80);
+  }
+
+  /**
+   * 补全单次请求的最大输出 token 数（硬上限，防止一次生成一大段）
+   */
+  static get completionMaxTokens(): number {
+    return vscode.workspace.getConfiguration('aiAssistant').get<number>('completionMaxTokens', 128);
+  }
+
+  /**
+   * 补全结果最多保留的行数（超出截断到语义完整的行）
+   */
+  static get completionMaxLines(): number {
+    return vscode.workspace.getConfiguration('aiAssistant').get<number>('completionMaxLines', 5);
+  }
+
+  /**
+   * 补全专用 temperature（低于对话温度，结果更稳定、更少幻觉）
+   */
+  static get completionTemperature(): number {
+    return vscode.workspace.getConfiguration('aiAssistant').get<number>('completionTemperature', 0.1);
   }
 
   /**
